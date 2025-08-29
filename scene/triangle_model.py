@@ -392,15 +392,20 @@ class TriangleModel:
 
         return np.asarray(points)
 
-    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float, opacity : float, init_size : float, nb_points: int, set_sigma : float, no_dome: bool):
+    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float, init_opacity : float, init_size : float, nb_points: int, set_sigma : float, no_dome: bool):
 
         self.spatial_lr_scale = spatial_lr_scale
         pcd_points = np.asarray(pcd.points)
         total_number_of_points = pcd_points.shape[0]
+        print(f"[DEBUG] PCD points shape: {pcd_points.shape}")
+        print(f"[DEBUG] Total number of points: {total_number_of_points}")
+        
         shapes_to_add = int(total_number_of_points * 0.05)
         radius = np.max(np.abs(pcd_points))
         sky_box_points = self.fibonacci_sphere(shapes_to_add) * radius
         pcd_colors = np.asarray(pcd.colors)
+        print(f"[DEBUG] PCD colors shape: {pcd_colors.shape}")
+        print(f"[DEBUG] Sky box points shape: {sky_box_points.shape}")
 
         if no_dome:
             total_points = pcd_points
@@ -437,7 +442,15 @@ class TriangleModel:
         
         radii = init_size * torch.sqrt(dist2).unsqueeze(1)
 
+        print(f"[DEBUG] Input to generate_triangles_in_chunks:")
+        print(f"[DEBUG]   x shape: {x.shape}, y shape: {y.shape}, z shape: {z.shape}")
+        print(f"[DEBUG]   radii shape: {radii.shape}")
+        print(f"[DEBUG]   nb_points: {nb_points}")
+        
         points_per_triangle = generate_triangles_in_chunks(x, y, z, radii, nb_points)
+        
+        print(f"[DEBUG] Generated points_per_triangle shape: {points_per_triangle.shape}")
+        print(f"[DEBUG] Points per triangle tensor: {points_per_triangle}")
 
         num_points_per_triangle = []
         for i in range(points_per_triangle.size(0)):
@@ -446,7 +459,7 @@ class TriangleModel:
         cumsum_of_points_per_triangle = torch.cumsum(torch.nn.functional.pad(tensor_num_points_per_triangle, (1,0), value=0), 0, dtype=torch.int)[:-1]
         number_of_points = points_per_triangle.shape[0]
 
-        opacities = inverse_sigmoid(opacity * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        opacities = inverse_sigmoid(init_opacity * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
         sigmas = self.inverse_exponential_activation(torch.ones((number_of_points, 1), dtype=torch.float, device="cuda") *  set_sigma)
                     
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
@@ -728,7 +741,7 @@ class TriangleModel:
         target_num = min(cap_max, int(self.add_shape * current_num_points))
         num_gs = max(0, target_num - current_num_points)
 
-        num_gs += dead_mask.sum()
+        num_gs += dead_mask.sum() if dead_mask is not None else 0
 
         if num_gs <= 0:
             return 0
@@ -740,7 +753,8 @@ class TriangleModel:
             probs = self.get_sigma.squeeze(-1) 
             probs = 1 / (probs + eps)
             
-        probs[dead_mask] = 0
+        if dead_mask is not None:
+            probs[dead_mask] = 0
 
         compar = self.image_size
         big_mask   = compar > self.split_size
@@ -800,7 +814,8 @@ class TriangleModel:
 
         mask = torch.zeros(self._opacity.shape[0], dtype=torch.bool)
         mask[add_idx] = True
-        mask[torch.nonzero(dead_mask, as_tuple=True)] = True
+        if dead_mask is not None:
+            mask[torch.nonzero(dead_mask, as_tuple=True)] = True
         self.prune_points(mask)
 
         self.triangle_area = torch.zeros((self.get_triangles_points.shape[0]), device="cuda")

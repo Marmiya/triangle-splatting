@@ -36,6 +36,12 @@ def render(viewpoint_camera, pc : TriangleModel, pipe, bg_color : torch.Tensor, 
     """
  
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
+    # Check if tensor has the expected dimensions
+    if pc.get_triangles_points.ndim < 3:
+        print(f"[ERROR] Triangle points tensor has insufficient dimensions: {pc.get_triangles_points.ndim}")
+        print(f"[ERROR] Expected shape: (N, 3, 3), got shape: {pc.get_triangles_points.shape}")
+        raise ValueError(f"Triangle points tensor should have 3 dimensions, got {pc.get_triangles_points.ndim}")
+    
     screenspace_points = torch.zeros_like(pc.get_triangles_points[:,0,:].squeeze(), dtype=pc.get_triangles_points.dtype, requires_grad=True, device="cuda") + 0
     scaling = torch.zeros_like(pc.get_triangles_points[:,0,0].squeeze(), dtype=pc.get_triangles_points.dtype, requires_grad=True, device="cuda").detach()
     density_factor = torch.zeros_like(pc.get_triangles_points[:,0,0].squeeze(), dtype=pc.get_triangles_points.dtype, requires_grad=True, device="cuda").detach()
