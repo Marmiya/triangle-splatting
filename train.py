@@ -41,6 +41,34 @@ except ImportError:
 import lpips
 
 
+def render_and_save_images(triangles, cameras, pipe, background, output_dir, iteration):
+    """Render and save first 5 training images at specified iterations"""
+    import torchvision
+    
+    render_dir = os.path.join(output_dir, f"training_renders_iter_{iteration}")
+    os.makedirs(render_dir, exist_ok=True)
+    
+    print(f"[DEBUG] Saving {len(cameras)} rendered images to: {render_dir}")
+    
+    with torch.no_grad():
+        for idx, camera in enumerate(cameras):
+            # Render image
+            render_pkg = render(camera, triangles, pipe, background)
+            image = torch.clamp(render_pkg["render"], 0.0, 1.0)
+            
+            # Save rendered image
+            render_path = os.path.join(render_dir, f'training_view_{idx:02d}_render.png')
+            torchvision.utils.save_image(image, render_path)
+            
+            # Save ground truth for comparison (only at iteration 1 to avoid duplicates)
+            if iteration == 1:
+                gt_image = torch.clamp(camera.original_image.cuda(), 0.0, 1.0)
+                gt_path = os.path.join(render_dir, f'training_view_{idx:02d}_gt.png')
+                torchvision.utils.save_image(gt_image, gt_path)
+            
+            print(f"[DEBUG] Saved render {idx+1}/{len(cameras)}: {render_path}")
+
+
 def training(
         dataset,   
         opt, 
@@ -92,6 +120,9 @@ def training(
     else:
         loss_fn = l1_loss
 
+    # Get training cameras for image rendering
+    train_cameras = scene.getTrainCameras()
+    
     for iteration in range(first_iter, opt.iterations + 1):
 
         iter_start.record()
@@ -111,6 +142,7 @@ def training(
                 new_round = False
 
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+        
 
 
         # Render
@@ -311,6 +343,23 @@ def training_report(tb_writer, iteration, pixel_loss, loss, loss_fn, elapsed, te
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+                    
+                    # Also save PNG files directly for easy viewing (first 5 images of each config)
+                    if idx < 5:
+                        import torchvision
+                        render_dir = os.path.join(scene.model_path, f"debug_renders_iter_{iteration}")
+                        os.makedirs(render_dir, exist_ok=True)
+                        
+                        # Save rendered image
+                        render_path = os.path.join(render_dir, f'{config["name"]}_view_{idx:02d}_render.png')
+                        torchvision.utils.save_image(image, render_path)
+                        
+                        # Save ground truth (only for first iteration to avoid duplicates)
+                        if iteration == testing_iterations[0]:
+                            gt_path = os.path.join(render_dir, f'{config["name"]}_view_{idx:02d}_gt.png')
+                            torchvision.utils.save_image(gt_image, gt_path)
+                        
+                        print(f"[DEBUG] Saved render to: {render_path}")
                     pixel_loss_test += loss_fn(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
                     ssim_test += ssim(image, gt_image).mean().double()
@@ -339,7 +388,7 @@ if __name__ == "__main__":
     pp = PipelineParams(parser)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[1000, 30_000])  # Reduced for speed
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])

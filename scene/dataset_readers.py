@@ -265,7 +265,168 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
                            ply_path=ply_path)
     return scene_info
 
+def readVCCSimCameras(camera_infos, images_folder):
+    """
+    Read VCCSim camera data directly from camera_info.json - no pose file needed
+    The C++ VCCSimDataConverter has already processed poses into camera_info.json
+    """
+    cam_infos = []
+    
+    for idx, camera_info in enumerate(camera_infos):
+        sys.stdout.write('\r')
+        sys.stdout.write("Reading VCCSim camera {}/{}".format(idx+1, len(camera_infos)))
+        sys.stdout.flush()
+        
+        # Get pose data directly from camera_info (already processed by VCCSimDataConverter)
+        rotation = camera_info.get('rotation', [0, 0, 0, 1])  # [qx, qy, qz, qw]
+        translation = camera_info.get('translation', [0, 0, 0])  # [x, y, z]
+        
+        # VCCSim stores Camera to World (C2W) format: camera position and rotation in world coordinates
+        # But Triangle Splatting expects World to Camera (W2C) format (same as COLMAP)
+        # Need to convert C2W to W2C by matrix inversion
+        
+        # Convert quaternion to rotation matrix (C2W rotation)
+        # VCCSim stores as [qx, qy, qz, qw], qvec2rotmat expects [qw, qx, qy, qz] (COLMAP format)
+        qvec_vccsim = np.array(rotation)  # [qx, qy, qz, qw]
+        qvec_colmap = np.array([qvec_vccsim[3], qvec_vccsim[0], qvec_vccsim[1], qvec_vccsim[2]])  # [qw, qx, qy, qz]
+        R_c2w = qvec2rotmat(qvec_colmap)  # Camera to World rotation matrix
+        t_c2w = np.array(translation)     # Camera to World translation (camera position in world)
+        
+        # Convert C2W to W2C by matrix inversion
+        # For a transformation matrix [R t; 0 1], the inverse is [R^T -R^T*t; 0 1]
+        R_w2c = R_c2w.T                   # W2C rotation = transpose of C2W rotation
+        t_w2c = -R_w2c @ t_c2w            # W2C translation = -R^T * camera_position
+        
+        # Apply the same transpose as COLMAP processing for consistency
+        R = np.transpose(R_w2c)
+        T = t_w2c
+        
+        # Get camera parameters (already processed by VCCSimDataConverter)
+        width = camera_info.get('width', 1920)
+        height = camera_info.get('height', 1080)
+        focal_x = camera_info.get('focal_x', width / (2.0 * np.tan(np.radians(90.0) / 2.0)))
+        focal_y = camera_info.get('focal_y', focal_x)
+        
+        # Calculate FOV
+        FovX = focal2fov(focal_x, width)
+        FovY = focal2fov(focal_y, height)
+        
+        # Get image info - support both jpg and png
+        image_name = camera_info.get('image_name', f'image_{idx:06d}.jpg')  # Default to jpg
+        image_path = camera_info.get('image_path', os.path.join(images_folder, image_name))
+        
+        # If image_path from camera_info doesn't exist, try in images_folder
+        if not os.path.exists(image_path):
+            image_path = os.path.join(images_folder, image_name)
+        
+        if os.path.exists(image_path):
+            try:
+                image = Image.open(image_path)
+                # Convert to RGB if needed (handles various formats)
+                if image.mode != 'RGB':
+                    image = image.convert('RGB')
+            except Exception as e:
+                print(f"Warning: Error loading image {image_path}: {e}, creating dummy image")
+                image = Image.new('RGB', (width, height), color=(128, 128, 128))
+        else:
+            # Create dummy image if not found
+            print(f"Warning: Image not found: {image_path}, creating dummy image")
+            image = Image.new('RGB', (width, height), color=(128, 128, 128))
+        
+        uid = camera_info.get('uid', idx)
+        
+        cam_infos.append(CameraInfo(
+            uid=uid, 
+            R=R, 
+            T=T, 
+            FovY=FovY, 
+            FovX=FovX, 
+            image=image,
+            image_path=image_path, 
+            image_name=image_name, 
+            width=width, 
+            height=height
+        ))
+    
+    print()  # New line after progress
+    return cam_infos
+
+def readVCCSimSceneInfo(config_path, images=None, eval=False):
+    """
+    Read VCCSim scene data directly from VCCSim configuration files
+    Args:
+        config_path: Path to VCCSim config directory containing camera_info.json and PLY file
+        images: Images directory path (can be None, will use image_path from camera_info)
+        eval: Whether to split train/test cameras
+    """
+    print("Reading VCCSim Scene Info")
+    
+    # Load VCCSim configuration (optional - mainly for image_directory fallback)
+    config_file = os.path.join(config_path, 'vccsim_training_config.json')
+    vccsim_config = {}
+    if os.path.exists(config_file):
+        with open(config_file, 'r') as f:
+            vccsim_config = json.load(f)
+    
+    # Load camera info (contains all pose and camera data)
+    camera_info_file = os.path.join(config_path, 'camera_info.json')
+    if not os.path.exists(camera_info_file):
+        raise FileNotFoundError(f"Camera info file not found: {camera_info_file}")
+        
+    with open(camera_info_file, 'r') as f:
+        camera_infos = json.load(f)
+    
+    print(f"Loaded {len(camera_infos)} cameras from camera_info.json")
+    
+    # Determine images folder (fallback only if image_path in camera_info is not absolute)
+    if images is None:
+        images_folder = vccsim_config.get('image_directory', '')
+    else:
+        images_folder = images
+    
+    # Read cameras - pose data already processed by VCCSimDataConverter
+    print("Reading VCCSim Cameras")
+    cam_infos_unsorted = readVCCSimCameras(camera_infos, images_folder)
+    cam_infos = sorted(cam_infos_unsorted.copy(), key=lambda x: x.image_name)
+    
+    # Split train/test if eval
+    if eval:
+        # Use every 8th image for testing (similar to COLMAP default)
+        train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % 8 != 0]
+        test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % 8 == 0]
+    else:
+        train_cam_infos = cam_infos
+        test_cam_infos = []
+    
+    print(f"Split cameras: {len(train_cam_infos)} training, {len(test_cam_infos)} test")
+    
+    # Calculate normalization
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+    
+    # Load point cloud
+    ply_file = os.path.join(config_path, 'init_points.ply')
+    if not os.path.exists(ply_file):
+        raise FileNotFoundError(f"PLY file not found: {ply_file}")
+    
+    try:
+        pcd = fetchPly(ply_file)
+        print(f"Loaded point cloud with {len(pcd.points)} points from {ply_file}")
+    except Exception as e:
+        print(f"Error loading PLY file: {e}")
+        raise
+    
+    scene_info = SceneInfo(
+        point_cloud=pcd,
+        train_cameras=train_cam_infos,
+        test_cameras=test_cam_infos,
+        nerf_normalization=nerf_normalization,
+        ply_path=ply_file
+    )
+    
+    return scene_info
+
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
-    "Blender" : readNerfSyntheticInfo
+    "Blender": readNerfSyntheticInfo,
+    "VCCSim": readVCCSimSceneInfo
 }
