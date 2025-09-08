@@ -615,10 +615,39 @@ class TriangleModel:
         self._sigma = optimizable_tensors["sigma"]
         self._mask = optimizable_tensors["mask"]
 
-        self.denom = torch.zeros((self.get_triangles_points.shape[0], 1), device="cuda")
-        self.max_radii2D = torch.zeros((self.get_triangles_points.shape[0]), device="cuda")
-        self.max_density_factor = torch.zeros((self.get_triangles_points.shape[0]), device="cuda")
-        self.triangle_area = torch.zeros((self.get_triangles_points.shape[0]), device="cuda")
+        # CRITICAL FIX: Preserve existing statistics during densification
+        current_count = self.get_triangles_points.shape[0]
+        
+        # Always reset denom, max_radii2D, max_density_factor as these are temporary per-frame statistics  
+        self.denom = torch.zeros((current_count, 1), device="cuda")
+        self.max_radii2D = torch.zeros((current_count), device="cuda")
+        self.max_density_factor = torch.zeros((current_count), device="cuda")
+        
+        # Preserve triangle_area, image_size, importance_score as these are cumulative training statistics
+        old_count = len(self.triangle_area) if hasattr(self, 'triangle_area') and self.triangle_area is not None else 0
+        if old_count > 0 and old_count < current_count:
+            # Extend existing statistics for new triangles
+            new_triangle_area = torch.zeros(current_count, device="cuda")
+            if hasattr(self, 'image_size') and self.image_size is not None:
+                new_image_size = torch.zeros(current_count, device="cuda")  
+            if hasattr(self, 'importance_score') and self.importance_score is not None:
+                new_importance_score = torch.zeros(current_count, device="cuda")
+            
+            # Copy existing statistics
+            new_triangle_area[:old_count] = self.triangle_area[:old_count]
+            if hasattr(self, 'image_size') and self.image_size is not None:
+                new_image_size[:old_count] = self.image_size[:old_count]
+            if hasattr(self, 'importance_score') and self.importance_score is not None:
+                new_importance_score[:old_count] = self.importance_score[:old_count]
+            
+            self.triangle_area = new_triangle_area
+            if hasattr(self, 'image_size'):
+                self.image_size = new_image_size
+            if hasattr(self, 'importance_score'):
+                self.importance_score = new_importance_score
+        elif old_count == 0:
+            # First initialization
+            self.triangle_area = torch.zeros(current_count, device="cuda")
 
         self.max_scaling = torch.cat((self.max_scaling, torch.zeros(new_opacities.shape[0], device="cuda")),dim=0)
 
@@ -818,15 +847,62 @@ class TriangleModel:
             mask[torch.nonzero(dead_mask, as_tuple=True)] = True
         self.prune_points(mask)
 
-        self.triangle_area = torch.zeros((self.get_triangles_points.shape[0]), device="cuda")
-        self.image_size = torch.zeros((self.get_triangles_points.shape[0]), device="cuda")
-        self.importance_score = torch.zeros((self.get_triangles_points.shape[0]), device="cuda")
+        # CRITICAL FIX: Preserve existing triangle statistics instead of resetting all to zero
+        # This was causing loss convergence failure after densification
+        current_count = self.get_triangles_points.shape[0]
+        old_count = len(self.triangle_area) if hasattr(self, 'triangle_area') and self.triangle_area is not None else 0
+        
+        if old_count > 0:
+            # Preserve existing statistics and extend for new triangles
+            new_triangle_area = torch.zeros(current_count, device="cuda")
+            new_image_size = torch.zeros(current_count, device="cuda") 
+            new_importance_score = torch.zeros(current_count, device="cuda")
+            
+            # Copy preserved statistics (accounting for pruning in prune_points)
+            preserve_count = min(old_count, current_count)
+            if preserve_count > 0:
+                new_triangle_area[:preserve_count] = self.triangle_area[:preserve_count]
+                new_image_size[:preserve_count] = self.image_size[:preserve_count]
+                new_importance_score[:preserve_count] = self.importance_score[:preserve_count]
+            
+            self.triangle_area = new_triangle_area
+            self.image_size = new_image_size
+            self.importance_score = new_importance_score
+        else:
+            # First initialization
+            self.triangle_area = torch.zeros(current_count, device="cuda")
+            self.image_size = torch.zeros(current_count, device="cuda")
+            self.importance_score = torch.zeros(current_count, device="cuda")
 
     def remove_final_points(self, mask):
         self.prune_points(mask)
-        self.triangle_area = torch.zeros((self.get_triangles_points.shape[0]), device="cuda")
-        self.image_size = torch.zeros((self.get_triangles_points.shape[0]), device="cuda")
-        self.importance_score = torch.zeros((self.get_triangles_points.shape[0]), device="cuda")
+        
+        # CRITICAL FIX: Preserve existing triangle statistics for remaining triangles
+        # Only reset statistics for the new size, preserving what we can
+        current_count = self.get_triangles_points.shape[0] 
+        old_count = len(self.triangle_area) if hasattr(self, 'triangle_area') and self.triangle_area is not None else 0
+        
+        if old_count > 0:
+            # Preserve statistics for remaining triangles after pruning
+            new_triangle_area = torch.zeros(current_count, device="cuda")
+            new_image_size = torch.zeros(current_count, device="cuda")
+            new_importance_score = torch.zeros(current_count, device="cuda")
+            
+            # Copy preserved statistics up to the current count
+            preserve_count = min(old_count, current_count)
+            if preserve_count > 0:
+                new_triangle_area[:preserve_count] = self.triangle_area[:preserve_count]
+                new_image_size[:preserve_count] = self.image_size[:preserve_count]
+                new_importance_score[:preserve_count] = self.importance_score[:preserve_count]
+            
+            self.triangle_area = new_triangle_area
+            self.image_size = new_image_size  
+            self.importance_score = new_importance_score
+        else:
+            # First initialization
+            self.triangle_area = torch.zeros(current_count, device="cuda")
+            self.image_size = torch.zeros(current_count, device="cuda")
+            self.importance_score = torch.zeros(current_count, device="cuda")
 
 
     def reset_opacity(self, sigma_reset):

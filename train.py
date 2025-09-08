@@ -105,6 +105,15 @@ def training(
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+    
+    # Variables for triangle count and speed tracking
+    from datetime import datetime
+    import sys
+    initial_triangle_count = triangles.get_triangles_points.shape[0]
+    print(f"\n[TRIANGLE STATS] Initial triangles: {initial_triangle_count}", flush=True)
+    sys.stdout.flush()
+    last_speed_report_time = datetime.now()
+    last_speed_report_iter = first_iter
 
     total_dead = 0
 
@@ -119,9 +128,6 @@ def training(
         loss_fn = l2_loss
     else:
         loss_fn = l1_loss
-
-    # Get training cameras for image rendering
-    train_cameras = scene.getTrainCameras()
     
     for iteration in range(first_iter, opt.iterations + 1):
 
@@ -179,7 +185,7 @@ def training(
         loss_image = (1.0 - opt.lambda_dssim) * pixel_loss + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
 
         # loss opacity
-        loss_opacity = torch.abs(triangles.get_opacity).mean() * args.lambda_opacity
+        loss_opacity = torch.abs(triangles.get_opacity).mean() * opt.lambda_opacity
 
         # loss normal and distortion
         rend_normal  = render_pkg['rend_normal']
@@ -208,6 +214,20 @@ def training(
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
+                # Calculate triangle count and speed every 100 iterations
+                if iteration % 100 == 0:
+                    current_time = datetime.now()
+                    time_diff = (current_time - last_speed_report_time).total_seconds()
+                    iter_diff = iteration - last_speed_report_iter
+                    iterations_per_sec = iter_diff / time_diff if time_diff > 0 else 0
+                    current_triangle_count = triangles.get_triangles_points.shape[0]
+                    
+                    print(f"\n[TRIANGLE STATS] Iteration {iteration}: {current_triangle_count} triangles, {iterations_per_sec:.1f} iter/s", flush=True)
+                    sys.stdout.flush()
+                    
+                    last_speed_report_time = current_time
+                    last_speed_report_iter = iteration
+                
                 loss_dict = {
                     "Loss": f"{ema_loss_for_log:.{5}f}",
                 }
@@ -227,13 +247,15 @@ def training(
 
             if iteration < opt.densify_until_iter and iteration % opt.densification_interval == 0 and iteration > opt.densify_from_iter:
                 
+                triangle_count_before = triangles.get_triangles_points.shape[0]
+                
                 if number_of_views < 250:
-                    dead_mask = torch.logical_or((triangles.importance_score < args.importance_threshold).squeeze(),(triangles.get_opacity <= args.opacity_dead).squeeze())
+                    dead_mask = torch.logical_or((triangles.importance_score < opt.importance_threshold).squeeze(),(triangles.get_opacity <= opt.opacity_dead).squeeze())
                 else:
                     if not new_round:
-                        dead_mask = torch.logical_or((triangles.importance_score < args.importance_threshold).squeeze(),(triangles.get_opacity <= args.opacity_dead).squeeze())
+                        dead_mask = torch.logical_or((triangles.importance_score < opt.importance_threshold).squeeze(),(triangles.get_opacity <= opt.opacity_dead).squeeze())
                     else:
-                        dead_mask = (triangles.get_opacity <= args.opacity_dead).squeeze()
+                        dead_mask = (triangles.get_opacity <= opt.opacity_dead).squeeze()
 
                 if iteration > 1000 and not new_round:
                     mask_test = triangles.triangle_area < 2
@@ -262,16 +284,23 @@ def training(
                 new_round = False
 
                 triangles.add_new_gs(cap_max=opt.max_shapes, oddGroup=oddGroup, dead_mask=dead_mask)
+                
+                triangle_count_after = triangles.get_triangles_points.shape[0]
+                dead_count = dead_mask.sum().item()
+                print(f"[TRIANGLE STATS] Densification at iteration {iteration}: {dead_count} dead, {triangle_count_before} -> {triangle_count_after} triangles", flush=True)
+                sys.stdout.flush()
 
 
             if iteration > opt.densify_until_iter and iteration % opt.densification_interval == 0:
+                triangle_count_before = triangles.get_triangles_points.shape[0]
+                
                 if number_of_views < 250:
-                    dead_mask = torch.logical_or((triangles.importance_score < args.importance_threshold).squeeze(),(triangles.get_opacity <= args.opacity_dead).squeeze())
+                    dead_mask = torch.logical_or((triangles.importance_score < opt.importance_threshold).squeeze(),(triangles.get_opacity <= opt.opacity_dead).squeeze())
                 else:
                     if not new_round:
-                        dead_mask = torch.logical_or((triangles.importance_score < args.importance_threshold).squeeze(),(triangles.get_opacity <= args.opacity_dead).squeeze())
+                        dead_mask = torch.logical_or((triangles.importance_score < opt.importance_threshold).squeeze(),(triangles.get_opacity <= opt.opacity_dead).squeeze())
                     else:
-                        dead_mask = (triangles.get_opacity <= args.opacity_dead).squeeze()
+                        dead_mask = (triangles.get_opacity <= opt.opacity_dead).squeeze()
 
 
                 if not new_round:
@@ -280,12 +309,22 @@ def training(
                 triangles.remove_final_points(dead_mask)
                 removed_them = True
                 new_round = False
+                
+                triangle_count_after = triangles.get_triangles_points.shape[0]
+                removed_count = triangle_count_before - triangle_count_after
+                print(f"[TRIANGLE STATS] Final Pruning at iteration {iteration}: Removed {removed_count}, {triangle_count_before} -> {triangle_count_after} triangles", flush=True)
+                sys.stdout.flush()
 
             if iteration < opt.iterations:
                 triangles.optimizer.step()
                 triangles.optimizer.zero_grad(set_to_none = True)
                 
-    print("Training is done")
+    # Final triangle count report
+    final_triangle_count = triangles.get_triangles_points.shape[0]
+    print(f"[TRIANGLE STATS] Final triangles: {final_triangle_count} (started with {initial_triangle_count})", flush=True)
+    sys.stdout.flush()
+    print("Training is done", flush=True)
+    sys.stdout.flush()
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -388,7 +427,7 @@ if __name__ == "__main__":
     pp = PipelineParams(parser)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[1000, 30_000])  # Reduced for speed
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[1000, 3000, 5000, 7000, 15000, 30_000])  # Debug rendering schedule
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
