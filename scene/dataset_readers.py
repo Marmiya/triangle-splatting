@@ -278,8 +278,13 @@ def readVCCSimCameras(camera_infos, images_folder):
         sys.stdout.flush()
         
         # Get pose data directly from camera_info (already processed by VCCSimDataConverter)
-        rotation = camera_info.get('rotation', [0, 0, 0, 1])  # [qx, qy, qz, qw]
-        translation = camera_info.get('translation', [0, 0, 0])  # [x, y, z]
+        if 'rotation' not in camera_info:
+            raise ValueError(f"Camera {idx}: Missing required 'rotation' parameter")
+        if 'translation' not in camera_info:
+            raise ValueError(f"Camera {idx}: Missing required 'translation' parameter")
+        
+        rotation = camera_info['rotation']  # [qx, qy, qz, qw]
+        translation = camera_info['translation']  # [x, y, z]
         
         # VCCSim stores Camera to World (C2W) format: camera position and rotation in world coordinates
         # But Triangle Splatting expects World to Camera (W2C) format (same as COLMAP)
@@ -302,10 +307,17 @@ def readVCCSimCameras(camera_infos, images_folder):
         T = t_w2c
         
         # Get camera parameters (already processed by VCCSimDataConverter)
-        width = camera_info.get('width', 1920)
-        height = camera_info.get('height', 1080)
-        focal_x = camera_info.get('focal_x', width / (2.0 * np.tan(np.radians(90.0) / 2.0)))
-        focal_y = camera_info.get('focal_y', focal_x)
+        if 'width' not in camera_info:
+            raise ValueError(f"Camera {idx}: Missing required 'width' parameter")
+        if 'height' not in camera_info:
+            raise ValueError(f"Camera {idx}: Missing required 'height' parameter")
+        if 'focal_x' not in camera_info:
+            raise ValueError(f"Camera {idx}: Missing required 'focal_x' parameter")
+        
+        width = camera_info['width']
+        height = camera_info['height']
+        focal_x = camera_info['focal_x']
+        focal_y = camera_info.get('focal_y', focal_x)  # focal_y can fallback to focal_x for square pixels
         
         # Calculate FOV
         FovX = focal2fov(focal_x, width)
