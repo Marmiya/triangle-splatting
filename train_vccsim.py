@@ -57,9 +57,6 @@ except ImportError as e:
     print(f"Error importing triangle splatting modules: {e}")
     sys.exit(1)
 
-
-
-
 def prepare_output_and_logger(args):
     """Setup output directories and logger - based on original train.py"""
     if not args.model_path:
@@ -529,5 +526,3 @@ if __name__ == "__main__":
              logging_config,
              tb_writer,
              )
-    
-    # All done - final completion message already logged in training function
