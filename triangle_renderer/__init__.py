@@ -168,9 +168,3 @@ def render(viewpoint_camera, pc : TriangleModel, pipe, bg_color : torch.Tensor, 
     })
 
     return rets
-
-
-
-
-
- 
