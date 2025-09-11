@@ -10,6 +10,13 @@ This script is called by VCCSimPanel's "Train VCCSim" button with:
 - --workspace: Training session workspace directory
 """
 
+# ============================================================================
+# LOGGING CONFIGURATION
+# ============================================================================
+
+# Import VCCSim logger utilities
+from utils.vccsim_logger import VCCSimTrainingLogger, VCCSimLoggingConfig
+
 import os
 import sys
 import json
@@ -31,7 +38,6 @@ try:
     from utils.general_utils import safe_state
     from utils.loss_utils import l1_loss, ssim, equilateral_regularizer, l2_loss
     from utils.image_utils import psnr
-    from tqdm import tqdm
     
     # Optional tensorboard support
     try:
@@ -52,42 +58,6 @@ except ImportError as e:
     sys.exit(1)
 
 
-class VCCSimTrainingLogger:
-    """Logger that outputs progress in format expected by VCCSim C++ manager"""
-    
-    def __init__(self, log_file_path):
-        # Normalize path to use forward slashes and resolve relative paths
-        self.log_file_path = os.path.normpath(os.path.abspath(log_file_path)).replace('\\', '/')
-        self.ensure_log_dir()
-        
-    def ensure_log_dir(self):
-        """Ensure log directory exists"""
-        os.makedirs(os.path.dirname(self.log_file_path), exist_ok=True)
-        
-    def log(self, message, iteration=None, loss=None, psnr_val=None):
-        """Log message with timestamp"""
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        # Format for C++ progress parsing
-        if iteration is not None:
-            if loss is not None:
-                log_msg = f"[{timestamp}] Iteration {iteration}: Loss={loss:.6f}"
-                if psnr_val is not None:
-                    log_msg += f", PSNR={psnr_val:.2f}"
-            else:
-                log_msg = f"[{timestamp}] Iteration {iteration}: {message}"
-        else:
-            log_msg = f"[{timestamp}] {message}"
-            
-        print(log_msg)  # Console output
-        
-        # Write to log file for C++ monitoring
-        try:
-            with open(self.log_file_path, 'a', encoding='utf-8') as f:
-                f.write(log_msg + '\n')
-                f.flush()
-        except Exception as e:
-            print(f"Warning: Could not write to log file: {e}")
 
 
 def prepare_output_and_logger(args):
@@ -108,9 +78,10 @@ def prepare_output_and_logger(args):
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
     
-    # Setup logger
+    # Setup logger with performance-optimized configuration
     log_file = os.path.join(args.model_path, "python_training.log")
     logger = VCCSimTrainingLogger(log_file)
+    logging_config = VCCSimLoggingConfig.default_performance_optimized()
     
     # Setup tensorboard if available
     tb_writer = None
@@ -120,7 +91,7 @@ def prepare_output_and_logger(args):
         except:
             tb_writer = None
             
-    return tb_writer, logger
+    return tb_writer, logger, logging_config
 
 
 def training_report(tb_writer, iteration, pixel_loss, loss, loss_fn, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, logger):
@@ -174,7 +145,7 @@ def training_report(tb_writer, iteration, pixel_loss, loss, loss_fn, elapsed, te
                             gt_path = os.path.join(render_dir, f'{config["name"]}_view_{idx:02d}_gt.png')
                             torchvision.utils.save_image(gt_image, gt_path)
                         
-                        logger.log(f"[DEBUG] Saved render to: {render_path}")
+                        logger.log_debug_render_save(render_path)
                     pixel_loss_test += loss_fn(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
                     ssim_test += ssim(image, gt_image).mean().double()
@@ -185,7 +156,15 @@ def training_report(tb_writer, iteration, pixel_loss, loss, loss_fn, elapsed, te
                 ssim_test /= len(config['cameras'])
                 lpips_test /= len(config['cameras'])  
                 total_time /= len(config['cameras'])
-                logger.log(f"\n[ITER {iteration}] Evaluating {config['name']}: L1 {pixel_loss_test} PSNR {psnr_test} SSIM {ssim_test} LPIPS {lpips_test}")
+                
+                # Update PSNR cache for progress logging
+                if config['name'] == 'train':
+                    logger.update_psnr_cache(train_psnr=psnr_test.item())
+                elif config['name'] == 'test':
+                    logger.update_psnr_cache(test_psnr=psnr_test.item())
+                
+                # Use specialized logging method for evaluation results
+                logger.log_evaluation_results(iteration, config['name'], pixel_loss_test, psnr_test, ssim_test, lpips_test)
 
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', pixel_loss_test, iteration)
@@ -208,6 +187,7 @@ def training(
         checkpoint, 
         debug_from,
         logger,
+        logging_config,
         tb_writer
         ):
     """Main training function based on original train.py but with VCCSim logger"""
@@ -233,12 +213,11 @@ def training(
     number_of_views = len(viewpoint_stack)
 
     ema_loss_for_log = 0.0
-    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     
     # Variables for triangle count and speed tracking
     initial_triangle_count = triangles.get_triangles_points.shape[0]
-    logger.log(f"\n[TRIANGLE STATS] Initial triangles: {initial_triangle_count}")
+    logger.log_initial_stats(initial_triangle_count)
     last_speed_report_time = datetime.now()
     last_speed_report_iter = first_iter
 
@@ -337,34 +316,55 @@ def training(
         iter_end.record()
         
         with torch.no_grad():
-            # Progress bar
+            # Progress tracking and logging
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-            if iteration % 10 == 0:
-                # Calculate triangle count and speed every 100 iterations
-                if iteration % 100 == 0:
-                    current_time = datetime.now()
-                    time_diff = (current_time - last_speed_report_time).total_seconds()
-                    iter_diff = iteration - last_speed_report_iter
-                    iterations_per_sec = iter_diff / time_diff if time_diff > 0 else 0
-                    current_triangle_count = triangles.get_triangles_points.shape[0]
-                    
-                    logger.log(f"\n[TRIANGLE STATS] Iteration {iteration}: {current_triangle_count} triangles, {iterations_per_sec:.1f} iter/s")
-                    
+            current_triangle_count = triangles.get_triangles_points.shape[0]
+            
+            # Calculate speed for loss logging (every few iterations to avoid overhead)
+            current_speed = None
+            if iteration % 10 == 0:  # Calculate speed every 10 iterations
+                current_time = datetime.now()
+                time_diff = (current_time - last_speed_report_time).total_seconds()
+                iter_diff = iteration - last_speed_report_iter
+                if time_diff > 0 and iter_diff > 0:
+                    current_speed = iter_diff / time_diff
                     last_speed_report_time = current_time
                     last_speed_report_iter = iteration
+            
+            # Log loss updates at high frequency with speed information
+            if logging_config.should_log_loss(iteration):
+                logger.log_loss_update(iteration, ema_loss_for_log, current_speed)
+            
+            # Log PSNR updates (when available and at configured frequency)
+            if logging_config.should_log_psnr(iteration) and logger.latest_train_psnr is not None:
+                logger.log_psnr_update(iteration, logger.latest_train_psnr)
+            
+            # Log triangle statistics (removed redundant triangle count log)
+            if logging_config.should_log_triangle_stats(iteration):
+                logger.log_triangle_stats(iteration, current_triangle_count)
+            
+            # Optional frequent PSNR calculation (configurable)
+            if logging_config.should_calculate_frequent_psnr(iteration):
+                torch.cuda.empty_cache()  # Clear memory before PSNR calculation
                 
-                loss_dict = {
-                    "Loss": f"{ema_loss_for_log:.{5}f}",
-                }
-                progress_bar.set_postfix(loss_dict)
-                progress_bar.update(10)
-            if iteration == opt.iterations:
-                progress_bar.close()
+                # Quick PSNR calculation on a single training view (minimal impact)
+                if len(scene.getTrainCameras()) > 0:
+                    test_viewpoint = scene.getTrainCameras()[0]  # Use first training view
+                    with torch.no_grad():
+                        test_image = torch.clamp(render(test_viewpoint, triangles, pipe, background)["render"], 0.0, 1.0)
+                        test_gt = torch.clamp(test_viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                        current_psnr = psnr(test_image, test_gt).mean().item()
+                        
+                        # Update cached PSNR for progress logging
+                        logger.update_psnr_cache(train_psnr=current_psnr)
+                        logger.log(f"Quick PSNR check: {current_psnr:.2f}", iteration)
+                
+                torch.cuda.empty_cache()  # Clear memory after PSNR calculation
 
             # Log and save
             training_report(tb_writer, iteration, pixel_loss, loss, loss_fn, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), logger)
             if iteration in save_iterations:
-                logger.log("\n[ITER {}] Saving Triangles".format(iteration))
+                logger.log_checkpoint_save(iteration)
                 scene.save(iteration)
             if iteration % 1000 == 0:
                 total_dead = 0
@@ -411,7 +411,7 @@ def training(
                 
                 triangle_count_after = triangles.get_triangles_points.shape[0]
                 dead_count = dead_mask.sum().item()
-                logger.log(f"[TRIANGLE STATS] Densification at iteration {iteration}: {dead_count} dead, {triangle_count_before} -> {triangle_count_after} triangles")
+                logger.log_densification_stats(iteration, dead_count, triangle_count_before, triangle_count_after)
 
 
             if iteration > opt.densify_until_iter and iteration % opt.densification_interval == 0:
@@ -435,7 +435,7 @@ def training(
                 
                 triangle_count_after = triangles.get_triangles_points.shape[0]
                 removed_count = triangle_count_before - triangle_count_after
-                logger.log(f"[TRIANGLE STATS] Final Pruning at iteration {iteration}: Removed {removed_count}, {triangle_count_before} -> {triangle_count_after} triangles")
+                logger.log_pruning_stats(iteration, removed_count, triangle_count_before, triangle_count_after)
 
             if iteration < opt.iterations:
                 triangles.optimizer.step()
@@ -443,8 +443,8 @@ def training(
                 
     # Final triangle count report
     final_triangle_count = triangles.get_triangles_points.shape[0]
-    logger.log(f"[TRIANGLE STATS] Final triangles: {final_triangle_count} (started with {initial_triangle_count})")
-    logger.log("Training is done")
+    logger.log_final_stats(final_triangle_count, initial_triangle_count)
+    logger.log_completion()
 
 
 if __name__ == "__main__":
@@ -512,7 +512,7 @@ if __name__ == "__main__":
     safe_state(args.quiet)
     
     # Prepare output and logger
-    tb_writer, logger = prepare_output_and_logger(args)
+    tb_writer, logger, logging_config = prepare_output_and_logger(args)
 
     # Configure and run training exactly like original train.py
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
@@ -526,8 +526,8 @@ if __name__ == "__main__":
              args.start_checkpoint,
              args.debug_from,
              logger,
+             logging_config,
              tb_writer,
              )
     
-    # All done
-    logger.log("\nTraining complete.")
+    # All done - final completion message already logged in training function
