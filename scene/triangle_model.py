@@ -955,3 +955,123 @@ class TriangleModel:
         new_model.denom = torch.zeros((number_of_points, 1), device="cuda")
 
         return new_model
+
+    def create_from_mesh_triangles(self, preloaded_pcd: BasicPointCloud, spatial_lr_scale: float, init_opacity: float, set_sigma: float, is_mesh_data: bool = True):
+        """
+        Initialize triangles from preloaded mesh triangle data with high confidence.
+        This method uses data already loaded by dataset_readers to avoid redundant file I/O.
+        Args:
+            preloaded_pcd: BasicPointCloud containing mesh triangle vertices (already loaded by dataset_readers)
+            spatial_lr_scale: Spatial learning rate scale
+            init_opacity: Initial opacity value (will be boosted for mesh triangles due to high confidence)
+            set_sigma: Sigma parameter value
+            is_mesh_data: True if data comes from mesh triangles, False if from point cloud (affects confidence)
+        """
+        print("Starting high-confidence mesh triangle initialization")
+        
+        if preloaded_pcd is None:
+            print("[ERROR] No preloaded point cloud data provided")
+            return
+        
+        data_type = "mesh triangles" if is_mesh_data else "point cloud"
+        print(f"Using preloaded {data_type} with {len(preloaded_pcd.points)} vertices")
+        
+        # Convert BasicPointCloud to triangle data format
+        triangle_data = {
+            'vertices': preloaded_pcd.points.tolist(),
+            'colors': preloaded_pcd.colors.tolist(),
+            'use_faces': False  # BasicPointCloud format uses vertex-based data
+        }
+        
+        if not triangle_data or 'vertices' not in triangle_data:
+            print("[ERROR] No triangle data provided")
+            return
+        
+        # Process BasicPointCloud format (vertex-based data)
+        print("Processing BasicPointCloud vertex data")
+        vertices = np.array(triangle_data['vertices'], dtype=np.float32)
+        colors = np.array(triangle_data['colors'], dtype=np.float32)
+        
+        num_vertices = len(vertices)
+        if num_vertices % 3 != 0:
+            print(f"[ERROR] Invalid vertex count {num_vertices} - must be multiple of 3 for triangle data")
+            return
+            
+        num_triangles = num_vertices // 3
+        triangles_array = vertices.reshape(num_triangles, 3, 3)  # (N, 3, 3)
+        colors_array = colors.reshape(num_triangles, 3, 3)      # (N, 3, 3)
+        
+        print(f"Loaded {num_triangles} mesh triangles")
+        
+        # Set spatial learning rate scale
+        self.spatial_lr_scale = spatial_lr_scale
+        
+        # Convert triangles to PyTorch tensors
+        triangles_tensor = torch.tensor(triangles_array, dtype=torch.float32, device='cuda')  # (N, 3, 3)
+        colors_tensor = torch.tensor(colors_array, dtype=torch.float32, device='cuda')        # (N, 3, 3)
+        
+        
+        # For Triangle Splatting, we need per-triangle features, not per-vertex
+        # Average the colors of the 3 vertices to get per-triangle color
+        triangle_colors = colors_tensor.mean(dim=1)  # (N, 3) - average RGB per triangle
+        
+        # Convert colors to spherical harmonics (SH) representation
+        fused_color = RGB2SH(triangle_colors)  # (N, 3)
+        
+        # Create features tensor: (N, 3, SH_channels)
+        # Following the same pattern as create_from_pcd
+        features = torch.zeros((num_triangles, 3, (self.max_sh_degree + 1) ** 2), dtype=torch.float32, device='cuda')
+        features[:, :3, 0] = fused_color  # DC component
+        features[:, 3:, 1:] = 0.0         # Higher order SH components
+        
+        
+        # Initialize learnable parameters
+        self._features_dc = nn.Parameter(features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._triangles_points = nn.Parameter(triangles_tensor.requires_grad_(True))
+        
+        
+        # Initialize opacity and sigma with confidence boost for mesh data
+        # Mesh triangles get higher opacity due to geometric confidence
+        if is_mesh_data:
+            confidence_boost = 1.5  # 50% higher opacity for mesh triangles
+            actual_opacity = min(init_opacity * confidence_boost, 0.9)  # Cap at 0.9 to avoid over-confidence
+            print(f"Using confidence-boosted opacity: {actual_opacity:.3f} (original: {init_opacity:.3f})")
+        else:
+            actual_opacity = init_opacity
+            print(f"Using standard opacity for point cloud data: {actual_opacity:.3f}")
+            
+        opacities = inverse_sigmoid(actual_opacity * torch.ones((num_triangles, 1), dtype=torch.float32, device="cuda"))
+        sigmas = self.inverse_exponential_activation(torch.ones((num_triangles, 1), dtype=torch.float32, device="cuda") * set_sigma)
+        
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self._sigma = nn.Parameter(sigmas.requires_grad_(True))
+        
+        
+        # Initialize tracking variables (same as create_from_pcd pattern)
+        self.max_scaling = torch.zeros((num_triangles), dtype=torch.float32, device="cuda")
+        self.max_radii2D = torch.zeros((num_triangles), dtype=torch.float32, device="cuda")  
+        self.max_density_factor = torch.zeros((num_triangles), dtype=torch.float32, device="cuda")
+        self.triangle_area = torch.zeros((num_triangles), dtype=torch.float32, device="cuda")
+        self.image_size = torch.zeros((num_triangles), dtype=torch.float32, device="cuda")
+        self.importance_score = torch.zeros((num_triangles), dtype=torch.float32, device="cuda")
+        
+        # Initialize mask parameter
+        self._mask = nn.Parameter(torch.ones((num_triangles, 1), device="cuda").requires_grad_(True))
+        
+        # Set up triangle management (similar to point cloud approach)
+        # Each mesh triangle corresponds to 1 triangle primitive (nb_points = 3 vertices per triangle)
+        self.nb_points = 3
+        
+        # For mesh triangles, we have a direct 1:1 mapping
+        num_points_per_triangle = [3] * num_triangles  # Each triangle has 3 points
+        self._num_points_per_triangle = torch.tensor(num_points_per_triangle, dtype=torch.int, device='cuda')
+        self._cumsum_of_points_per_triangle = torch.cumsum(
+            torch.nn.functional.pad(self._num_points_per_triangle, (1,0), value=0), 0, dtype=torch.int)[:-1]
+        self._number_of_points = num_triangles
+        
+        
+        # Initialize accumulation buffer (will be set up properly in training_setup)
+        self.denom = torch.zeros((num_triangles, 1), device="cuda")
+        
+        print(f"Mesh triangle initialization completed: {num_triangles} triangles")

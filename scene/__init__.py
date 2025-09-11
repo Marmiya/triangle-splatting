@@ -84,7 +84,46 @@ class Scene:
                                                 )
                                     )
         else:
-            self.triangles.create_from_pcd(scene_info.point_cloud, self.cameras_extent, init_opacity, init_size, nb_points, set_sigma, no_dome)
+            # Check configuration for mesh triangle initialization
+            config_file = os.path.join(args.source_path, 'vccsim_training_config.json')
+            use_mesh_triangles = False
+            mesh_triangles_file = None
+            
+            if os.path.exists(config_file):
+                try:
+                    import json
+                    with open(config_file, 'r') as f:
+                        config = json.load(f)
+                        mesh_config = config.get('mesh', {})
+                        use_mesh_triangles = mesh_config.get('use_mesh_triangles', False)
+                        mesh_triangles_file = mesh_config.get('mesh_triangles_file', None)
+                        print(f"[DEBUG] Configuration loaded: use_mesh_triangles={use_mesh_triangles}")
+                        if mesh_triangles_file:
+                            print(f"[DEBUG] Mesh triangles file: {mesh_triangles_file}")
+                except Exception as e:
+                    print(f"[WARNING] Failed to load VCCSim configuration: {e}")
+            
+            if use_mesh_triangles and mesh_triangles_file and os.path.exists(mesh_triangles_file):
+                print("Using direct mesh triangle initialization")
+                # Use preloaded mesh triangle data with high confidence
+                self.triangles.create_from_mesh_triangles(
+                    scene_info.point_cloud, self.cameras_extent, init_opacity, set_sigma, 
+                    is_mesh_data=True)
+            else:
+                if use_mesh_triangles:
+                    if not mesh_triangles_file:
+                        print("[WARNING] Mesh triangle mode enabled but no mesh triangles file specified")
+                    elif not os.path.exists(mesh_triangles_file):
+                        print(f"[WARNING] Mesh triangles file not found: {mesh_triangles_file}")
+                    
+                    # Still use mesh triangle initialization method but with lower confidence
+                    print("Using mesh triangle method with point cloud data (lower confidence)")
+                    self.triangles.create_from_mesh_triangles(
+                        scene_info.point_cloud, self.cameras_extent, init_opacity, set_sigma,
+                        is_mesh_data=False)
+                else:
+                    print("Using traditional point cloud initialization") 
+                    self.triangles.create_from_pcd(scene_info.point_cloud, self.cameras_extent, init_opacity, init_size, nb_points, set_sigma, no_dome)
 
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))

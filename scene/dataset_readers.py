@@ -115,13 +115,155 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
     sys.stdout.write('\n')
     return cam_infos
 
-def fetchPly(path):
+def fetchPly(path, use_parallel=None, num_workers=4):
+    """
+    Load PLY file with automatic optimization based on file size
+    Args:
+        path: PLY file path
+        use_parallel: Force parallel loading (None=auto, True=parallel, False=single-thread)
+        num_workers: Number of parallel workers for processing
+    """
+    print(f"Loading PLY file: {path}")
+    import time
+    start_time = time.time()
+    
+    # Check file size to decide loading strategy
+    file_size_mb = os.path.getsize(path) / (1024 * 1024)
+    print(f"PLY file size: {file_size_mb:.1f} MB")
+    
+    # Auto-decide parallel strategy for large files
+    if use_parallel is None:
+        use_parallel = file_size_mb > 50.0  # Use parallel for files > 50MB
+    
+    if use_parallel:
+        print(f"Using parallel loading with {num_workers} workers for large file")
+        return _fetchPlyParallel(path, num_workers)
+    else:
+        print("Using single-threaded loading")
+        return _fetchPlySingleThread(path)
+
+
+def _fetchPlySingleThread(path):
+    """Optimized single-threaded PLY loading"""
+    import time
+    start_time = time.time()
+    
     plydata = PlyData.read(path)
     vertices = plydata['vertex']
-    positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
-    colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
-    normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    num_vertices = len(vertices)
+    
+    print(f"PLY file loaded in {time.time() - start_time:.2f}s, processing {num_vertices} vertices...")
+    process_start = time.time()
+    
+    # Pre-allocate arrays for better performance
+    positions = np.empty((num_vertices, 3), dtype=np.float32)
+    colors = np.empty((num_vertices, 3), dtype=np.float32)
+    normals = np.empty((num_vertices, 3), dtype=np.float32)
+    
+    # Direct array assignment (faster than vstack)
+    positions[:, 0] = vertices['x']
+    positions[:, 1] = vertices['y']
+    positions[:, 2] = vertices['z']
+    
+    colors[:, 0] = vertices['red'] / 255.0
+    colors[:, 1] = vertices['green'] / 255.0
+    colors[:, 2] = vertices['blue'] / 255.0
+    
+    normals[:, 0] = vertices['nx']
+    normals[:, 1] = vertices['ny']
+    normals[:, 2] = vertices['nz']
+    
+    print(f"Data processing completed in {time.time() - process_start:.2f}s")
+    print(f"Total PLY loading time: {time.time() - start_time:.2f}s")
+    
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
+
+
+def _fetchPlyParallel(path, num_workers=4):
+    """Parallel PLY loading for large files"""
+    import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
+    start_time = time.time()
+    
+    # Load PLY data (still single-threaded due to plyfile limitation)
+    plydata = PlyData.read(path)
+    vertices = plydata['vertex']
+    num_vertices = len(vertices)
+    
+    load_time = time.time() - start_time
+    print(f"PLY file loaded in {load_time:.2f}s, processing {num_vertices} vertices with {num_workers} workers...")
+    
+    # Process data in parallel chunks
+    process_start = time.time()
+    chunk_size = max(1000, num_vertices // num_workers)  # Minimum chunk size of 1000
+    
+    def process_chunk(start_idx, end_idx):
+        """Process a chunk of vertices"""
+        chunk_vertices = vertices[start_idx:end_idx]
+        chunk_size = end_idx - start_idx
+        
+        positions = np.empty((chunk_size, 3), dtype=np.float32)
+        colors = np.empty((chunk_size, 3), dtype=np.float32)
+        normals = np.empty((chunk_size, 3), dtype=np.float32)
+        
+        positions[:, 0] = chunk_vertices['x']
+        positions[:, 1] = chunk_vertices['y']
+        positions[:, 2] = chunk_vertices['z']
+        
+        colors[:, 0] = chunk_vertices['red'] / 255.0
+        colors[:, 1] = chunk_vertices['green'] / 255.0
+        colors[:, 2] = chunk_vertices['blue'] / 255.0
+        
+        normals[:, 0] = chunk_vertices['nx']
+        normals[:, 1] = chunk_vertices['ny']
+        normals[:, 2] = chunk_vertices['nz']
+        
+        return start_idx, positions, colors, normals
+    
+    # Create processing tasks
+    tasks = []
+    for i in range(0, num_vertices, chunk_size):
+        start_idx = i
+        end_idx = min(i + chunk_size, num_vertices)
+        tasks.append((start_idx, end_idx))
+    
+    print(f"Processing {len(tasks)} chunks in parallel...")
+    
+    # Execute tasks in parallel
+    results = []
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        future_to_task = {
+            executor.submit(process_chunk, start, end): (start, end)
+            for start, end in tasks
+        }
+        
+        for future in as_completed(future_to_task):
+            start, end = future_to_task[future]
+            try:
+                start_idx, positions, colors, normals = future.result()
+                results.append((start_idx, positions, colors, normals))
+                print(f"Processed chunk [{start}:{end}] ({end-start} vertices)")
+            except Exception as e:
+                print(f"Error processing chunk [{start}:{end}]: {e}")
+                raise
+    
+    # Sort results by start index and concatenate
+    results.sort(key=lambda x: x[0])
+    
+    print("Concatenating parallel results...")
+    all_positions = np.concatenate([r[1] for r in results], axis=0)
+    all_colors = np.concatenate([r[2] for r in results], axis=0)
+    all_normals = np.concatenate([r[3] for r in results], axis=0)
+    
+    process_time = time.time() - process_start
+    total_time = time.time() - start_time
+    
+    print(f"Parallel processing completed in {process_time:.2f}s")
+    print(f"Total PLY loading time: {total_time:.2f}s")
+    print(f"Performance: {num_vertices / total_time:.0f} vertices/second")
+    
+    return BasicPointCloud(points=all_positions, colors=all_colors, normals=normals)
 
 def storePly(path, xyz, rgb):
     # Define the dtype for the structured array
@@ -273,9 +415,6 @@ def readVCCSimCameras(camera_infos, images_folder):
     cam_infos = []
     
     for idx, camera_info in enumerate(camera_infos):
-        sys.stdout.write('\r')
-        sys.stdout.write("Reading VCCSim camera {}/{}".format(idx+1, len(camera_infos)))
-        sys.stdout.flush()
         
         # Get pose data directly from camera_info (already processed by VCCSimDataConverter)
         if 'rotation' not in camera_info:
@@ -360,7 +499,6 @@ def readVCCSimCameras(camera_infos, images_folder):
             height=height
         ))
     
-    print()  # New line after progress
     return cam_infos
 
 def readVCCSimSceneInfo(config_path, images=None, eval=False):
@@ -415,17 +553,30 @@ def readVCCSimSceneInfo(config_path, images=None, eval=False):
     # Calculate normalization
     nerf_normalization = getNerfppNorm(train_cam_infos)
     
-    # Load point cloud
-    ply_file = os.path.join(config_path, 'init_points.ply')
-    if not os.path.exists(ply_file):
-        raise FileNotFoundError(f"PLY file not found: {ply_file}")
+    # Check for mesh triangles first, then fallback to point cloud
+    mesh_triangles_file = os.path.join(config_path, 'mesh_triangles.ply')
+    init_points_file = os.path.join(config_path, 'init_points.ply')
     
-    try:
-        pcd = fetchPly(ply_file)
-        print(f"Loaded point cloud with {len(pcd.points)} points from {ply_file}")
-    except Exception as e:
-        print(f"Error loading PLY file: {e}")
-        raise
+    if os.path.exists(mesh_triangles_file):
+        # Use mesh triangles for initialization
+        ply_file = mesh_triangles_file
+        try:
+            pcd = fetchPly(ply_file)
+            print(f"Loaded mesh triangles with {len(pcd.points)} triangle vertices from {ply_file}")
+        except Exception as e:
+            print(f"Error loading mesh triangles PLY file: {e}")
+            raise
+    elif os.path.exists(init_points_file):
+        # Fallback to traditional point cloud
+        ply_file = init_points_file
+        try:
+            pcd = fetchPly(ply_file)
+            print(f"Loaded point cloud with {len(pcd.points)} points from {ply_file}")
+        except Exception as e:
+            print(f"Error loading point cloud PLY file: {e}")
+            raise
+    else:
+        raise FileNotFoundError(f"No initialization data found: neither {mesh_triangles_file} nor {init_points_file} exists")
     
     scene_info = SceneInfo(
         point_cloud=pcd,
