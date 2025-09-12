@@ -115,6 +115,32 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
     sys.stdout.write('\n')
     return cam_infos
 
+def fetchMeshData(path, use_parallel=None, num_workers=8):
+    """
+    Load mesh data with automatic format detection and optimization
+    Supports both PLY and NPY chunk formats for maximum performance
+    Args:
+        path: Base path (can be .ply file or directory with .npy chunks)
+        use_parallel: Force parallel loading (None=auto, True=parallel, False=single-thread)  
+        num_workers: Number of parallel workers
+    """
+    # Check if NPY chunks are available (fastest option)
+    npy_chunks_dir = _getNpyChunksDir(path)
+    if npy_chunks_dir and os.path.exists(npy_chunks_dir):
+        print(f"Found NPY chunks directory: {npy_chunks_dir}")
+        return _loadNpyChunks(npy_chunks_dir, num_workers)
+    
+    # Fallback to PLY loading
+    if not path.endswith('.ply'):
+        path = path.replace('_chunks', '.ply')  # Try converting chunks path to ply path
+    
+    if os.path.exists(path):
+        print(f"No NPY chunks found, falling back to PLY: {path}")
+        return fetchPly(path, use_parallel, num_workers)
+    else:
+        raise FileNotFoundError(f"Neither NPY chunks nor PLY file found for: {path}")
+
+
 def fetchPly(path, use_parallel=None, num_workers=4):
     """
     Load PLY file with automatic optimization based on file size
@@ -264,6 +290,143 @@ def _fetchPlyParallel(path, num_workers=4):
     print(f"Performance: {num_vertices / total_time:.0f} vertices/second")
     
     return BasicPointCloud(points=all_positions, colors=all_colors, normals=normals)
+
+
+def _getNpyChunksDir(base_path):
+    """Get NPY chunks directory path from base path"""
+    if base_path.endswith('.ply'):
+        # Convert mesh_triangles.ply -> mesh_triangles_chunks/
+        base_name = os.path.splitext(base_path)[0]
+        return base_name + '_chunks'
+    elif os.path.isdir(base_path):
+        return base_path
+    else:
+        return base_path + '_chunks'
+
+
+def _loadNpyChunks(chunks_dir, num_workers=8):
+    """
+    Load mesh data from NPY chunks in parallel - MUCH faster than PLY
+    Expected directory structure:
+    mesh_triangles_chunks/
+    ├── positions_chunk_00.npy
+    ├── positions_chunk_01.npy  
+    ├── colors_chunk_00.npy
+    ├── colors_chunk_01.npy
+    ├── normals_chunk_00.npy
+    └── normals_chunk_01.npy
+    """
+    import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import glob
+    
+    start_time = time.time()
+    
+    # Find all chunk files
+    position_chunks = sorted(glob.glob(os.path.join(chunks_dir, 'positions_chunk_*.npy')))
+    color_chunks = sorted(glob.glob(os.path.join(chunks_dir, 'colors_chunk_*.npy')))
+    normal_chunks = sorted(glob.glob(os.path.join(chunks_dir, 'normals_chunk_*.npy')))
+    
+    if not position_chunks:
+        raise FileNotFoundError(f"No NPY chunk files found in {chunks_dir}")
+    
+    num_chunks = len(position_chunks)
+    print(f"Loading {num_chunks} NPY chunks with {min(num_workers, num_chunks)} workers...")
+    
+    def load_chunk_set(chunk_idx):
+        """Load one set of chunks (positions, colors, normals)"""
+        pos_file = position_chunks[chunk_idx] if chunk_idx < len(position_chunks) else None
+        color_file = color_chunks[chunk_idx] if chunk_idx < len(color_chunks) else None
+        normal_file = normal_chunks[chunk_idx] if chunk_idx < len(normal_chunks) else None
+        
+        positions = np.load(pos_file, allow_pickle=True) if pos_file else None
+        colors = np.load(color_file, allow_pickle=True) if color_file else None
+        normals = np.load(normal_file, allow_pickle=True) if normal_file else None
+        
+        return chunk_idx, positions, colors, normals
+    
+    # Load chunks in parallel
+    chunk_data = []
+    with ThreadPoolExecutor(max_workers=min(num_workers, num_chunks)) as executor:
+        future_to_idx = {
+            executor.submit(load_chunk_set, i): i 
+            for i in range(num_chunks)
+        }
+        
+        for future in as_completed(future_to_idx):
+            chunk_idx = future_to_idx[future]
+            try:
+                idx, positions, colors, normals = future.result()
+                chunk_data.append((idx, positions, colors, normals))
+                print(f"Loaded chunk {chunk_idx+1}/{num_chunks} ({len(positions) if positions is not None else 0} vertices)")
+            except Exception as e:
+                print(f"Error loading chunk {chunk_idx}: {e}")
+                raise
+    
+    # Sort by chunk index and concatenate
+    chunk_data.sort(key=lambda x: x[0])
+    
+    all_positions = np.concatenate([data[1] for data in chunk_data if data[1] is not None], axis=0)
+    all_colors = np.concatenate([data[2] for data in chunk_data if data[2] is not None], axis=0)
+    all_normals = np.concatenate([data[3] for data in chunk_data if data[3] is not None], axis=0)
+    
+    total_time = time.time() - start_time
+    total_vertices = len(all_positions)
+    
+    print(f"NPY chunk loading completed in {total_time:.2f}s")
+    print(f"Total vertices loaded: {total_vertices}")
+    print(f"Performance: {total_vertices / total_time:.0f} vertices/second")
+    
+    return BasicPointCloud(points=all_positions, colors=all_colors, normals=all_normals)
+
+
+def saveNpyChunks(output_dir, positions, colors, normals, num_chunks=8):
+    """
+    Save mesh data as NPY chunks for fast parallel loading
+    This should be called from C++ side during mesh generation
+    """
+    import os
+    
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    num_vertices = len(positions)
+    chunk_size = (num_vertices + num_chunks - 1) // num_chunks  # Ceiling division
+    
+    print(f"Saving {num_vertices} vertices as {num_chunks} NPY chunks to {output_dir}")
+    
+    for i in range(num_chunks):
+        start_idx = i * chunk_size
+        end_idx = min(start_idx + chunk_size, num_vertices)
+        
+        if start_idx >= num_vertices:
+            break
+            
+        # Save each chunk
+        pos_chunk = positions[start_idx:end_idx]
+        color_chunk = colors[start_idx:end_idx]
+        normal_chunk = normals[start_idx:end_idx]
+        
+        np.save(os.path.join(output_dir, f'positions_chunk_{i:02d}.npy'), pos_chunk)
+        np.save(os.path.join(output_dir, f'colors_chunk_{i:02d}.npy'), color_chunk)
+        np.save(os.path.join(output_dir, f'normals_chunk_{i:02d}.npy'), normal_chunk)
+        
+        print(f"Saved chunk {i+1}/{num_chunks}: {end_idx-start_idx} vertices")
+    
+    # Save metadata
+    metadata = {
+        'num_chunks': num_chunks,
+        'total_vertices': num_vertices,
+        'chunk_size': chunk_size,
+        'format_version': '1.0'
+    }
+    
+    import json
+    with open(os.path.join(output_dir, 'chunk_metadata.json'), 'w') as f:
+        json.dump(metadata, f, indent=2)
+    
+    print(f"NPY chunks saved successfully: {num_chunks} chunks, {num_vertices} total vertices")
+
 
 def storePly(path, xyz, rgb):
     # Define the dtype for the structured array
@@ -558,22 +721,22 @@ def readVCCSimSceneInfo(config_path, images=None, eval=False):
     init_points_file = os.path.join(config_path, 'init_points.ply')
     
     if os.path.exists(mesh_triangles_file):
-        # Use mesh triangles for initialization
+        # Use mesh triangles for initialization (prioritize NPY chunks if available)
         ply_file = mesh_triangles_file
         try:
-            pcd = fetchPly(ply_file)
+            pcd = fetchMeshData(ply_file, use_parallel=True, num_workers=8)
             print(f"Loaded mesh triangles with {len(pcd.points)} triangle vertices from {ply_file}")
         except Exception as e:
-            print(f"Error loading mesh triangles PLY file: {e}")
+            print(f"Error loading mesh triangles file: {e}")
             raise
     elif os.path.exists(init_points_file):
-        # Fallback to traditional point cloud
+        # Fallback to traditional point cloud (also check for NPY chunks)
         ply_file = init_points_file
         try:
-            pcd = fetchPly(ply_file)
+            pcd = fetchMeshData(ply_file, use_parallel=True, num_workers=8)
             print(f"Loaded point cloud with {len(pcd.points)} points from {ply_file}")
         except Exception as e:
-            print(f"Error loading point cloud PLY file: {e}")
+            print(f"Error loading point cloud file: {e}")
             raise
     else:
         raise FileNotFoundError(f"No initialization data found: neither {mesh_triangles_file} nor {init_points_file} exists")
