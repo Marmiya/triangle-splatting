@@ -464,7 +464,7 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
-    parser.add_argument("--no_dome", action="store_true", default=False)
+    parser.add_argument("--no_dome", action="store_true", default=True)
     parser.add_argument("--outdoor", action="store_true", default=False)
     
     # Parse arguments once like original train.py

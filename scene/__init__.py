@@ -88,6 +88,7 @@ class Scene:
             config_file = os.path.join(args.source_path, 'vccsim_training_config.json')
             use_mesh_triangles = False
             mesh_triangles_file = None
+            mesh_opacity = init_opacity  # Default to the provided init_opacity
             
             if os.path.exists(config_file):
                 try:
@@ -97,17 +98,19 @@ class Scene:
                         mesh_config = config.get('mesh', {})
                         use_mesh_triangles = mesh_config.get('use_mesh_triangles', False)
                         mesh_triangles_file = mesh_config.get('mesh_triangles_file', None)
+                        mesh_opacity = mesh_config.get('mesh_opacity', init_opacity)
                         print(f"[DEBUG] Configuration loaded: use_mesh_triangles={use_mesh_triangles}")
+                        print(f"[DEBUG] Mesh opacity override: {mesh_opacity}")
                         if mesh_triangles_file:
                             print(f"[DEBUG] Mesh triangles file: {mesh_triangles_file}")
                 except Exception as e:
                     print(f"[WARNING] Failed to load VCCSim configuration: {e}")
             
             if use_mesh_triangles and mesh_triangles_file and os.path.exists(mesh_triangles_file):
-                print("Using direct mesh triangle initialization")
+                print(f"Using direct mesh triangle initialization with opacity={mesh_opacity}")
                 # Use preloaded mesh triangle data with high confidence
                 self.triangles.create_from_mesh_triangles(
-                    scene_info.point_cloud, self.cameras_extent, init_opacity, set_sigma, 
+                    scene_info.point_cloud, self.cameras_extent, mesh_opacity, set_sigma, 
                     is_mesh_data=True)
             else:
                 if use_mesh_triangles:
@@ -117,9 +120,9 @@ class Scene:
                         print(f"[WARNING] Mesh triangles file not found: {mesh_triangles_file}")
                     
                     # Still use mesh triangle initialization method but with lower confidence
-                    print("Using mesh triangle method with point cloud data (lower confidence)")
+                    print(f"Using mesh triangle method with point cloud data (lower confidence) with opacity={mesh_opacity}")
                     self.triangles.create_from_mesh_triangles(
-                        scene_info.point_cloud, self.cameras_extent, init_opacity, set_sigma,
+                        scene_info.point_cloud, self.cameras_extent, mesh_opacity, set_sigma,
                         is_mesh_data=False)
                 else:
                     print("Using traditional point cloud initialization") 

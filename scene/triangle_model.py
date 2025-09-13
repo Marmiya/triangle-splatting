@@ -963,7 +963,7 @@ class TriangleModel:
         Args:
             preloaded_pcd: BasicPointCloud containing mesh triangle vertices (already loaded by dataset_readers)
             spatial_lr_scale: Spatial learning rate scale
-            init_opacity: Initial opacity value (will be boosted for mesh triangles due to high confidence)
+            init_opacity: Initial opacity value
             set_sigma: Sigma parameter value
             is_mesh_data: True if data comes from mesh triangles, False if from point cloud (affects confidence)
         """
@@ -1031,17 +1031,11 @@ class TriangleModel:
         self._triangles_points = nn.Parameter(triangles_tensor.requires_grad_(True))
         
         
-        # Initialize opacity and sigma with confidence boost for mesh data
-        # Mesh triangles get higher opacity due to geometric confidence
-        if is_mesh_data:
-            confidence_boost = 1.5  # 50% higher opacity for mesh triangles
-            actual_opacity = min(init_opacity * confidence_boost, 0.9)  # Cap at 0.9 to avoid over-confidence
-            print(f"Using confidence-boosted opacity: {actual_opacity:.3f} (original: {init_opacity:.3f})")
-        else:
-            actual_opacity = init_opacity
-            print(f"Using standard opacity for point cloud data: {actual_opacity:.3f}")
+        # Initialize opacity and sigma using the configured opacity value
+        data_type = "mesh triangles" if is_mesh_data else "point cloud data"
+        print(f"Using configured opacity for {data_type}: {init_opacity:.3f}")
             
-        opacities = inverse_sigmoid(actual_opacity * torch.ones((num_triangles, 1), dtype=torch.float32, device="cuda"))
+        opacities = inverse_sigmoid(init_opacity * torch.ones((num_triangles, 1), dtype=torch.float32, device="cuda"))
         sigmas = self.inverse_exponential_activation(torch.ones((num_triangles, 1), dtype=torch.float32, device="cuda") * set_sigma)
         
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
