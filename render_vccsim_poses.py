@@ -31,6 +31,10 @@ MODEL_PATH = r"C:\UEProjects\VCCSimDev\Saved\RatSplatting\TriangleSplatting\RatS
 # Path to VCCSim poses.txt file (format: timestamp x y z qx qy qz qw)
 POSES_FILE = r"C:\UEProjects\VCCSimDev\Saved\pose_ue.txt"
 
+# Optional path to COLMAP cameras.txt file (used when vccsim_training_config.json is not available)
+# Set to None to disable COLMAP camera reading, or provide path to cameras.txt
+COLMAP_CAMERAS_FILE = None  # Example: r"C:\path\to\colmap\cameras.txt"
+
 # Output image dimensions (focal lengths will be computed from training config)
 IMAGE_WIDTH = 1920
 IMAGE_HEIGHT = 1080
@@ -106,6 +110,69 @@ def load_training_config(model_path):
         'original_focal_x': camera_config.get('focal_length_x', 1000.0),
         'original_focal_y': camera_config.get('focal_length_y', 1000.0),
         'fov_degrees': camera_config.get('fov_degrees', 60.0)
+    }
+
+def load_colmap_cameras(cameras_file):
+    """Load camera parameters from COLMAP cameras.txt file"""
+    if not os.path.exists(cameras_file):
+        raise FileNotFoundError(f"COLMAP cameras file not found: {cameras_file}")
+
+    cameras = {}
+    with open(cameras_file, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+
+            camera_id = int(parts[0])
+            model = parts[1]
+            width = int(parts[2])
+            height = int(parts[3])
+
+            if model == "PINHOLE" and len(parts) >= 8:
+                fx = float(parts[4])
+                fy = float(parts[5])
+                cx = float(parts[6])
+                cy = float(parts[7])
+
+                cameras[camera_id] = {
+                    'width': width,
+                    'height': height,
+                    'focal_x': fx,
+                    'focal_y': fy,
+                    'cx': cx,
+                    'cy': cy
+                }
+            elif model == "SIMPLE_PINHOLE" and len(parts) >= 7:
+                f = float(parts[4])
+                cx = float(parts[5])
+                cy = float(parts[6])
+
+                cameras[camera_id] = {
+                    'width': width,
+                    'height': height,
+                    'focal_x': f,
+                    'focal_y': f,
+                    'cx': cx,
+                    'cy': cy
+                }
+
+    if not cameras:
+        raise ValueError(f"No valid PINHOLE cameras found in {cameras_file}")
+
+    # Use the first camera for rendering parameters
+    first_camera = next(iter(cameras.values()))
+
+    return {
+        'original_width': first_camera['width'],
+        'original_height': first_camera['height'],
+        'original_focal_x': first_camera['focal_x'],
+        'original_focal_y': first_camera['focal_y'],
+        'fov_degrees': 60.0  # Default FOV, will be computed from focal lengths
     }
 
 def compute_scaled_focal_lengths(original_config, target_width, target_height):
@@ -208,7 +275,7 @@ def create_camera_infos_from_poses(poses, width, height, focal_x, focal_y):
 # =============================================================================
 
 def render_pose_sequence(model_path, poses_file, output_dir, width, height,
-                        iteration=-1, white_background=False, resolution_scale=1.0):
+                        iteration=-1, white_background=False, resolution_scale=1.0, colmap_cameras_file=None):
     """
     Render a sequence of images from VCCSim poses
     """
@@ -216,9 +283,32 @@ def render_pose_sequence(model_path, poses_file, output_dir, width, height,
     # Ensure output directory exists
     makedirs(output_dir, exist_ok=True)
 
-    # Load training configuration to get camera parameters
-    print("Loading training configuration...")
-    training_config = load_training_config(model_path)
+    # Load camera configuration - try VCCSim config first, then COLMAP if available
+    print("Loading camera configuration...")
+    training_config = None
+
+    # Try VCCSim training config first
+    try:
+        training_config = load_training_config(model_path)
+        print("Loaded VCCSim training configuration")
+    except FileNotFoundError:
+        print("VCCSim training config not found, checking for COLMAP cameras...")
+
+        # Try COLMAP cameras.txt if specified (parameter takes precedence over global)
+        cameras_file = colmap_cameras_file or COLMAP_CAMERAS_FILE
+        if cameras_file and os.path.exists(cameras_file):
+            training_config = load_colmap_cameras(cameras_file)
+            print(f"Loaded COLMAP camera configuration from: {cameras_file}")
+        else:
+            # Fallback to default values
+            print("Warning: No camera configuration found, using default values")
+            training_config = {
+                'original_width': 1920,
+                'original_height': 1080,
+                'original_focal_x': 1000.0,
+                'original_focal_y': 1000.0,
+                'fov_degrees': 60.0
+            }
 
     # Compute scaled focal lengths based on target resolution
     focal_x, focal_y = compute_scaled_focal_lengths(training_config, width, height)
@@ -323,7 +413,8 @@ if __name__ == "__main__":
             height=IMAGE_HEIGHT,
             iteration=ITERATION,
             white_background=WHITE_BACKGROUND,
-            resolution_scale=RESOLUTION_SCALE
+            resolution_scale=RESOLUTION_SCALE,
+            colmap_cameras_file=COLMAP_CAMERAS_FILE
         )
     except Exception as e:
         print(f"Error during rendering: {e}")
