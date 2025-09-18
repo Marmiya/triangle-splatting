@@ -489,8 +489,14 @@ if __name__ == "__main__":
     
     # Override paths for VCCSim data format like original train.py modifies args
     args.source_path = os.path.dirname(config_file)  # Config directory
-    args.images = config.get('image_directory', '')  # Image directory  
+    args.images = config.get('image_directory', '')  # Image directory
     args.model_path = workspace_normalized  # Output goes to workspace
+
+    # Apply max_iterations from config if specified
+    if 'training' in config and 'max_iterations' in config['training']:
+        args.iterations = config['training']['max_iterations']
+        print(f"[CONFIG] Using max_iterations from config: {args.iterations}")
+
     args.save_iterations.append(args.iterations)  # Like original train.py
 
     print("Optimizing " + args.model_path)
