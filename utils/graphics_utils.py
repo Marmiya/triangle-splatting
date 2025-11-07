@@ -86,3 +86,40 @@ def fov2focal(fov, pixels):
 
 def focal2fov(focal, pixels):
     return 2*math.atan(pixels/(2*focal))
+
+
+def getWorld2ViewOpenGL(R_c2w_colmap, camera_pos, translate=np.array([.0, .0, .0]), scale=1.0):
+    """
+    Build world-to-view transform with COLMAP→OpenGL coordinate conversion
+
+    Based on test_nvdiffrast_obj.py verified implementation.
+
+    COLMAP camera: X-right, Y-down, Z-forward
+    OpenGL camera: X-right, Y-up, Z-backward
+
+    Args:
+        R_c2w_colmap: Camera-to-world rotation matrix (COLMAP coordinates) [3, 3]
+        camera_pos: Camera position in world [3]
+        translate: Additional translation [3]
+        scale: Scale factor (float)
+
+    Returns:
+        4x4 world-to-camera transform matrix (OpenGL coordinates)
+    """
+    T_colmap_to_opengl = np.array([
+        [1,  0,  0],
+        [0, -1,  0],
+        [0,  0, -1]
+    ], dtype=np.float32)
+
+    R_c2w_opengl = R_c2w_colmap @ T_colmap_to_opengl
+    R_w2c = R_c2w_opengl.T
+
+    camera_center = (camera_pos + translate) * scale
+    t_w2c = -R_w2c @ camera_center
+
+    view_mat = np.eye(4, dtype=np.float32)
+    view_mat[:3, :3] = R_w2c
+    view_mat[:3, 3] = t_w2c
+
+    return view_mat

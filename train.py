@@ -68,7 +68,6 @@ def render_and_save_images(triangles, cameras, pipe, background, output_dir, ite
             
             print(f"[DEBUG] Saved render {idx+1}/{len(cameras)}: {render_path}")
 
-
 def training(
         dataset,   
         opt, 

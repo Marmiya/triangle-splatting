@@ -173,23 +173,98 @@ def training_report(tb_writer, iteration, pixel_loss, loss, loss_fn, elapsed, te
         torch.cuda.empty_cache()
 
 
+def get_model_memory_stats_sh(model):
+    """Calculate detailed memory statistics for SH model parameters"""
+    total_params = 0
+    param_breakdown = {}
+
+    for name, param in [
+        ('features_dc', model._features_dc),
+        ('features_rest', model._features_rest),
+        ('opacity', model._opacity),
+        ('triangles_points', model._triangles_points),
+        ('sigma', model._sigma),
+        ('mask', model._mask)
+    ]:
+        if param.numel() > 0:
+            count = param.numel()
+            size_mb = count * param.element_size() / (1024 * 1024)
+            param_breakdown[name] = {
+                'count': count,
+                'size_mb': size_mb,
+                'shape': tuple(param.shape)
+            }
+            total_params += count
+
+    total_size_mb = sum(p['size_mb'] for p in param_breakdown.values())
+
+    return {
+        'total_params': total_params,
+        'total_size_mb': total_size_mb,
+        'breakdown': param_breakdown,
+        'sh_degree': model.max_sh_degree
+    }
+
+
+def print_sh_model_stats(stats, num_triangles):
+    """Print detailed statistics for SH model"""
+    print("\n" + "="*80)
+    print("SPHERICAL HARMONICS MODEL STATISTICS")
+    print("="*80)
+
+    sh_degree = stats['sh_degree']
+    sh_coeffs = (sh_degree + 1) ** 2
+
+    print(f"\nTriangles: {num_triangles:,}")
+    print(f"SH Degree: {sh_degree} ({sh_coeffs} coefficients per RGB channel)")
+
+    print(f"\n{'Parameter Type':<30} {'Count':<15} {'Size (MB)':<15}")
+    print("-" * 60)
+
+    # Calculate per-triangle parameters
+    features_total = stats['breakdown']['features_dc']['count'] + stats['breakdown']['features_rest']['count']
+    features_per_tri = features_total / num_triangles if num_triangles > 0 else 0
+
+    print(f"{'SH Features (appearance)':<30} {features_total:>14,} {stats['breakdown']['features_dc']['size_mb'] + stats['breakdown']['features_rest']['size_mb']:>14.2f}")
+    print(f"{'  - DC component':<30} {stats['breakdown']['features_dc']['count']:>14,} {stats['breakdown']['features_dc']['size_mb']:>14.2f}")
+    print(f"{'  - Rest components':<30} {stats['breakdown']['features_rest']['count']:>14,} {stats['breakdown']['features_rest']['size_mb']:>14.2f}")
+    print(f"{'Geometry (vertices)':<30} {stats['breakdown']['triangles_points']['count']:>14,} {stats['breakdown']['triangles_points']['size_mb']:>14.2f}")
+    print(f"{'Opacity':<30} {stats['breakdown']['opacity']['count']:>14,} {stats['breakdown']['opacity']['size_mb']:>14.2f}")
+    print(f"{'Sigma (window)':<30} {stats['breakdown']['sigma']['count']:>14,} {stats['breakdown']['sigma']['size_mb']:>14.2f}")
+    print(f"{'Mask':<30} {stats['breakdown']['mask']['count']:>14,} {stats['breakdown']['mask']['size_mb']:>14.2f}")
+
+    print("-" * 60)
+    print(f"{'Total':<30} {stats['total_params']:>14,} {stats['total_size_mb']:>14.2f}")
+    print(f"{'Per-triangle':<30} {stats['total_params']/num_triangles:>14.1f} {stats['total_size_mb']/num_triangles*1024:>14.3f} KB")
+
+    print("\n" + "="*80)
+    print(f"Note: SH features use {sh_coeffs * 3} params/triangle for appearance")
+    print(f"      (3 RGB channels × {sh_coeffs} coefficients)")
+    print("="*80 + "\n")
+
+
 def training(
-        dataset,   
-        opt, 
+        dataset,
+        opt,
         pipe,
-        no_dome, 
+        no_dome,
         outdoor,
         testing_iterations,
         save_iterations,
-        checkpoint, 
+        checkpoint,
         debug_from,
         logger,
         logging_config,
         tb_writer
         ):
     """Main training function based on original train.py but with VCCSim logger"""
-    
+
     first_iter = 0
+
+    # Print initial memory statistics
+    torch.cuda.reset_peak_memory_stats()
+    initial_memory = torch.cuda.memory_allocated() / (1024 ** 3)
+    print(f"\n[MEMORY] Initial GPU memory: {initial_memory:.3f} GB")
 
     # Load parameters, triangles and scene
     triangles = TriangleModel(dataset.sh_degree)
@@ -215,6 +290,16 @@ def training(
     # Variables for triangle count and speed tracking
     initial_triangle_count = triangles.get_triangles_points.shape[0]
     logger.log_initial_stats(initial_triangle_count)
+
+    # Calculate and display model statistics
+    model_stats = get_model_memory_stats_sh(triangles)
+    print_sh_model_stats(model_stats, initial_triangle_count)
+
+    # Memory after model initialization
+    model_memory = torch.cuda.memory_allocated() / (1024 ** 3)
+    print(f"[MEMORY] After model init: {model_memory:.3f} GB (+{model_memory - initial_memory:.3f} GB)")
+    print(f"[MEMORY] Model parameters: {model_stats['total_params']:,} ({model_stats['total_size_mb']:.2f} MB)\n")
+
     last_speed_report_time = datetime.now()
     last_speed_report_iter = first_iter
 
@@ -339,7 +424,13 @@ def training(
             # Log triangle statistics (removed redundant triangle count log)
             if logging_config.should_log_triangle_stats(iteration):
                 logger.log_triangle_stats(iteration, current_triangle_count)
-            
+
+            # Memory monitoring at intervals
+            if iteration % 1000 == 0:
+                current_memory = torch.cuda.memory_allocated() / (1024 ** 3)
+                peak_memory = torch.cuda.max_memory_allocated() / (1024 ** 3)
+                print(f"[MEMORY] Iter {iteration}: Current {current_memory:.3f} GB, Peak {peak_memory:.3f} GB")
+
             # Optional frequent PSNR calculation (configurable)
             if logging_config.should_calculate_frequent_psnr(iteration):
                 torch.cuda.empty_cache()  # Clear memory before PSNR calculation
@@ -441,7 +532,43 @@ def training(
     # Final triangle count report
     final_triangle_count = triangles.get_triangles_points.shape[0]
     logger.log_final_stats(final_triangle_count, initial_triangle_count)
+
+    # Final memory and model statistics
+    final_memory = torch.cuda.memory_allocated() / (1024 ** 3)
+    peak_memory = torch.cuda.max_memory_allocated() / (1024 ** 3)
+    final_model_stats = get_model_memory_stats_sh(triangles)
+
+    print("\n" + "="*80)
+    print("TRAINING COMPLETE - FINAL STATISTICS (SPHERICAL HARMONICS)")
+    print("="*80)
+
+    # Triangle statistics
+    print(f"\nTriangle Count:")
+    print(f"  Initial: {initial_triangle_count:,}")
+    print(f"  Final:   {final_triangle_count:,}")
+    print(f"  Change:  {final_triangle_count - initial_triangle_count:+,} ({(final_triangle_count/initial_triangle_count - 1)*100:+.1f}%)")
+
+    # Memory statistics
+    print(f"\nGPU Memory Usage:")
+    print(f"  Final:   {final_memory:.3f} GB")
+    print(f"  Peak:    {peak_memory:.3f} GB")
+    print(f"  Model:   {final_model_stats['total_size_mb']:.2f} MB")
+
+    # Parameter statistics
+    print(f"\nModel Parameters:")
+    print(f"  Total:   {final_model_stats['total_params']:,}")
+    print(f"  Per-triangle: {final_model_stats['total_params'] / final_triangle_count:.1f}")
+
+    # SH parameter breakdown
+    print(f"\nSH Parameter Breakdown:")
+    for name, info in final_model_stats['breakdown'].items():
+        print(f"  {name:20s}: {info['count']:12,} params ({info['size_mb']:8.2f} MB) {info['shape']}")
+
+    # Detailed SH statistics
+    print_sh_model_stats(final_model_stats, final_triangle_count)
+
     logger.log_completion()
+    print("="*80)
 
 
 if __name__ == "__main__":
@@ -449,7 +576,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="VCCSim Triangle Splatting Training")
     
     # Add VCCSim-specific workspace argument first  
-    parser.add_argument("--workspace", required=True, help="Training session workspace directory")
+    parser.add_argument("--workspace", help="Training session workspace directory",
+                         default=r"C:\UEProjects\VCCSimDev\Saved\RatSplatting\RatSplatting\prepared_session_20251031_2016082")
     
     # Add standard Triangle Splatting parameter groups like original train.py
     lp = ModelParams(parser)
