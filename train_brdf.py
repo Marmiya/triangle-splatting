@@ -258,7 +258,24 @@ def training(dataset, opt, pipe, no_dome, outdoor, testing_iterations,
 
     loss_fn = l2_loss if (large_scene and outdoor) else l1_loss
 
-    print(f"\nStarting training: {initial_triangle_count} triangles, {opt.iterations} iterations")
+    print(f"\n{'='*80}")
+    print("TRAINING CONFIGURATION")
+    print(f"{'='*80}")
+    print(f"\nTriangle Count: {initial_triangle_count:,}")
+    print(f"Total Iterations: {opt.iterations}")
+    print(f"Number of Views: {number_of_views}")
+    print(f"\nDensification Parameters:")
+    print(f"  densify_from_iter: {opt.densify_from_iter}")
+    print(f"  densify_until_iter: {opt.densify_until_iter}")
+    print(f"  densification_interval: {opt.densification_interval}")
+    print(f"  importance_threshold: {opt.importance_threshold}")
+    print(f"  opacity_dead: {opt.opacity_dead}")
+    print(f"  max_shapes: {opt.max_shapes}")
+    print(f"\nScene Configuration:")
+    print(f"  large_scene: {large_scene}")
+    print(f"  outdoor: {outdoor}")
+    print(f"  loss_fn: {loss_fn.__name__}")
+    print(f"{'='*80}\n")
 
     # ========== Training Loop ==========
     for iteration in range(first_iter, opt.iterations + 1):
@@ -288,9 +305,17 @@ def training(dataset, opt, pipe, no_dome, outdoor, testing_iterations,
         render_pkg = render_brdf_wrapper(viewpoint_cam, triangles, pipe, bg)
         image = render_pkg["render"]
 
-        triangle_area = torch.zeros(triangles.get_triangles_points.shape[0], device="cuda")
-        image_size = torch.zeros(triangles.get_triangles_points.shape[0], device="cuda")
-        importance_score = torch.zeros(triangles.get_triangles_points.shape[0], device="cuda")
+        # Extract statistics from render package (CRITICAL: don't use zeros!)
+        triangle_area = render_pkg["density_factor"].detach()
+        image_size = render_pkg["scaling"].detach()
+        importance_score = render_pkg["max_blending"].detach()
+
+        # Debug: Print statistics every 100 iterations
+        if iteration % 100 == 0:
+            print(f"\n[DEBUG ITER {iteration}] Render statistics:")
+            print(f"  triangle_area    - min: {triangle_area.min().item():.6f}, max: {triangle_area.max().item():.6f}, mean: {triangle_area.mean().item():.6f}")
+            print(f"  image_size       - min: {image_size.min().item():.6f}, max: {image_size.max().item():.6f}, mean: {image_size.mean().item():.6f}")
+            print(f"  importance_score - min: {importance_score.min().item():.6f}, max: {importance_score.max().item():.6f}, mean: {importance_score.mean().item():.6f}")
 
         if new_round:
             mask = triangle_area > 1
@@ -353,10 +378,145 @@ def training(dataset, opt, pipe, no_dome, outdoor, testing_iterations,
                 logger.log_checkpoint_save(iteration)
                 scene.save(iteration)
 
-            # ========== DENSIFICATION AND PRUNING DISABLED ==========
-            # TODO: Redesign densification/pruning strategy for BRDF training
-            # The standard Triangle Splatting strategy needs adaptation for BRDF parameters
+            # Reset dead counter periodically
+            if iteration % 1000 == 0:
+                total_dead = 0
 
+            # ========== DENSIFICATION (during early training) ==========
+            if iteration < opt.densify_until_iter and iteration % opt.densification_interval == 0 and iteration > opt.densify_from_iter:
+
+                triangle_count_before = triangles.get_triangles_points.shape[0]
+
+                # Print accumulated statistics
+                print(f"\n[DEBUG PRE-DENSIFICATION ITER {iteration}]")
+                print(f"  Accumulated statistics:")
+                print(f"    triangles.triangle_area    - min: {triangles.triangle_area.min().item():.6f}, max: {triangles.triangle_area.max().item():.6f}, mean: {triangles.triangle_area.mean().item():.6f}")
+                print(f"    triangles.image_size       - min: {triangles.image_size.min().item():.6f}, max: {triangles.image_size.max().item():.6f}, mean: {triangles.image_size.mean().item():.6f}")
+                print(f"    triangles.importance_score - min: {triangles.importance_score.min().item():.6f}, max: {triangles.importance_score.max().item():.6f}, mean: {triangles.importance_score.mean().item():.6f}")
+                print(f"    triangles.get_opacity      - min: {triangles.get_opacity.min().item():.6f}, max: {triangles.get_opacity.max().item():.6f}, mean: {triangles.get_opacity.mean().item():.6f}")
+
+                # Calculate dead mask
+                if number_of_views < 250:
+                    dead_mask = torch.logical_or(
+                        (triangles.importance_score < opt.importance_threshold).squeeze(),
+                        (triangles.get_opacity <= opt.opacity_dead).squeeze()
+                    )
+                else:
+                    if not new_round:
+                        dead_mask = torch.logical_or(
+                            (triangles.importance_score < opt.importance_threshold).squeeze(),
+                            (triangles.get_opacity <= opt.opacity_dead).squeeze()
+                        )
+                    else:
+                        dead_mask = (triangles.get_opacity <= opt.opacity_dead).squeeze()
+
+                # Additional pruning conditions after iteration 1000
+                if iteration > 1000 and not new_round:
+                    mask_test = triangles.triangle_area < 2
+                    dead_mask = torch.logical_or(dead_mask, mask_test.squeeze())
+
+                    if not outdoor:
+                        mask_test = triangles.image_size > 1400
+                        dead_mask = torch.logical_or(dead_mask, mask_test.squeeze())
+
+                total_dead += dead_mask.sum()
+
+                # Debug: Print dead mask statistics
+                print(f"\n[DEBUG DENSIFICATION ITER {iteration}]")
+                print(f"  Triangle count before: {triangle_count_before}")
+                print(f"  Dead triangles: {dead_mask.sum().item()}")
+                print(f"  Dead ratio: {dead_mask.sum().item() / triangle_count_before * 100:.2f}%")
+                print(f"  Criteria breakdown:")
+                print(f"    - importance_score < {opt.importance_threshold}: {(triangles.importance_score < opt.importance_threshold).sum().item()}")
+                print(f"    - opacity <= {opt.opacity_dead}: {(triangles.get_opacity <= opt.opacity_dead).sum().item()}")
+                if iteration > 1000 and not new_round:
+                    print(f"    - triangle_area < 2: {(triangles.triangle_area < 2).sum().item()}")
+                    if not outdoor:
+                        print(f"    - image_size > 1400: {(triangles.image_size > 1400).sum().item()}")
+                print(f"  Accumulated dead count: {total_dead}")
+
+                # Determine densification strategy
+                if opt.proba_distr == 0:
+                    oddGroup = True
+                elif opt.proba_distr == 1:
+                    oddGroup = False
+                else:
+                    if opacity_now:
+                        oddGroup = opacity_now
+                        opacity_now = False
+                    else:
+                        oddGroup = opacity_now
+                        opacity_now = True
+
+                removed_them = True
+                new_round = False
+
+                # Add new triangles
+                triangles.add_new_gs(cap_max=opt.max_shapes, oddGroup=oddGroup, dead_mask=dead_mask)
+
+                triangle_count_after = triangles.get_triangles_points.shape[0]
+                dead_count = dead_mask.sum().item()
+                logger.log_densification_stats(iteration, dead_count, triangle_count_before, triangle_count_after)
+
+                print(f"  Triangle count after: {triangle_count_after}")
+                print(f"  Net change: {triangle_count_after - triangle_count_before:+d}")
+
+            # ========== PRUNING (after densification phase) ==========
+            if iteration > opt.densify_until_iter and iteration % opt.densification_interval == 0:
+                triangle_count_before = triangles.get_triangles_points.shape[0]
+
+                # Print accumulated statistics
+                print(f"\n[DEBUG PRE-PRUNING ITER {iteration}]")
+                print(f"  Accumulated statistics:")
+                print(f"    triangles.triangle_area    - min: {triangles.triangle_area.min().item():.6f}, max: {triangles.triangle_area.max().item():.6f}, mean: {triangles.triangle_area.mean().item():.6f}")
+                print(f"    triangles.image_size       - min: {triangles.image_size.min().item():.6f}, max: {triangles.image_size.max().item():.6f}, mean: {triangles.image_size.mean().item():.6f}")
+                print(f"    triangles.importance_score - min: {triangles.importance_score.min().item():.6f}, max: {triangles.importance_score.max().item():.6f}, mean: {triangles.importance_score.mean().item():.6f}")
+                print(f"    triangles.get_opacity      - min: {triangles.get_opacity.min().item():.6f}, max: {triangles.get_opacity.max().item():.6f}, mean: {triangles.get_opacity.mean().item():.6f}")
+
+                # Calculate dead mask
+                if number_of_views < 250:
+                    dead_mask = torch.logical_or(
+                        (triangles.importance_score < opt.importance_threshold).squeeze(),
+                        (triangles.get_opacity <= opt.opacity_dead).squeeze()
+                    )
+                else:
+                    if not new_round:
+                        dead_mask = torch.logical_or(
+                            (triangles.importance_score < opt.importance_threshold).squeeze(),
+                            (triangles.get_opacity <= opt.opacity_dead).squeeze()
+                        )
+                    else:
+                        dead_mask = (triangles.get_opacity <= opt.opacity_dead).squeeze()
+
+                # Additional pruning condition
+                if not new_round:
+                    mask_test = triangles.triangle_area < 2
+                    dead_mask = torch.logical_or(dead_mask, mask_test.squeeze())
+
+                # Debug: Print pruning statistics
+                print(f"\n[DEBUG PRUNING ITER {iteration}]")
+                print(f"  Triangle count before: {triangle_count_before}")
+                print(f"  Dead triangles: {dead_mask.sum().item()}")
+                print(f"  Dead ratio: {dead_mask.sum().item() / triangle_count_before * 100:.2f}%")
+                print(f"  Criteria breakdown:")
+                print(f"    - importance_score < {opt.importance_threshold}: {(triangles.importance_score < opt.importance_threshold).sum().item()}")
+                print(f"    - opacity <= {opt.opacity_dead}: {(triangles.get_opacity <= opt.opacity_dead).sum().item()}")
+                if not new_round:
+                    print(f"    - triangle_area < 2: {(triangles.triangle_area < 2).sum().item()}")
+
+                # Remove dead triangles
+                triangles.remove_final_points(dead_mask)
+                removed_them = True
+                new_round = False
+
+                triangle_count_after = triangles.get_triangles_points.shape[0]
+                removed_count = triangle_count_before - triangle_count_after
+                logger.log_pruning_stats(iteration, removed_count, triangle_count_before, triangle_count_after)
+
+                print(f"  Triangle count after: {triangle_count_after}")
+                print(f"  Removed: {removed_count}")
+
+            # ========== OPTIMIZER STEP ==========
             if iteration < opt.iterations:
                 triangles.optimizer.step()
                 triangles.optimizer.zero_grad(set_to_none=True)
